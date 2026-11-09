@@ -57,7 +57,11 @@ from sklearn.metrics.pairwise import cosine_similarity
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 # Pinned revision (commit) of the checkpoint on the Hugging Face Hub, so runs
 # are reproducible even if the model's default branch changes.
-MODEL_REVISION = "1110b5dce11483d046163640f88898a541d1a48a"
+# Round-2 correction: the previously pinned string was not a valid revision
+# of this repository (the Hub API rejects it), which made load_encoder()
+# fail before any download; it has been replaced with the model's actual
+# current main-branch commit.
+MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 POOLING = "mean pooling over token embeddings (checkpoint default), L2-normalised"
 
 # ---------------------------------------------------------------------------
@@ -179,6 +183,18 @@ def lift_by_position(message: str, encoder, prototype: np.ndarray) -> pd.DataFra
     once and removing it removed only / attributed the wrong occurrence.
     Here every position is removed by index and reported separately.
 
+    **Preprocessing consistency (round-2 fix):** the baseline and every
+    leave-one-out variant are scored on the SAME token list -- the baseline
+    is the score of ``" ".join(preprocess(message))`` and each variant is
+    that same joined token list with one position removed. An earlier
+    version scored the baseline on the *raw* message (via :func:`persona`)
+    while the variants were built from the *preprocessed* tokens, so every
+    lift contained a constant offset from the preprocessing difference
+    itself (stopwords/punctuation removed), and the sign of a single word's
+    lift was unreliable. Baseline and ablations must always go through
+    identical preprocessing, otherwise lift measures the preprocessing,
+    not the word.
+
     :param message: input message text
     :param encoder: a sentence-transformers model
     :param prototype: dictionary prototype from :func:`dictionary_prototype`
@@ -189,13 +205,15 @@ def lift_by_position(message: str, encoder, prototype: np.ndarray) -> pd.DataFra
     tokens = preprocess(message)
     if not tokens:
         return pd.DataFrame(columns=["position", "word", "lift"])
-    baseline = persona(message, encoder, prototype)
-    # Build every leave-one-out variant and embed them in ONE batched call.
+    # Score the baseline on the SAME preprocessed token list the variants
+    # are built from (see docstring) -- one batched call for all of them.
+    joined = " ".join(tokens)
     variants = [
         " ".join(tok for j, tok in enumerate(tokens) if j != i)
         for i in range(len(tokens))
     ]
-    variant_scores = interest_scores(variants, encoder, prototype)
+    scores = interest_scores([joined, *variants], encoder, prototype)
+    baseline, variant_scores = scores[0], scores[1:]
     return pd.DataFrame(
         {
             "position": list(range(len(tokens))),
@@ -212,14 +230,26 @@ def lift_by_position(message: str, encoder, prototype: np.ndarray) -> pd.DataFra
 def tfidf_scores(messages: list[str], dictionary: list[str] | None = None) -> np.ndarray:
     """TF-IDF cosine baseline.
 
-    The vectoriser is fitted on the dictionary entries; each message is
-    scored by its maximum cosine against a dictionary entry's TF-IDF vector.
+    The vectoriser is fitted on the dictionary entries and each message is
+    scored by its cosine against a single dictionary *prototype* -- the
+    mean (centroid) of the dictionary entries' TF-IDF vectors,
+    L2-normalised -- mirroring how the transformer score uses a prototype.
+
+    Round-2 fix: this previously took the *maximum* cosine against the
+    individual dictionary entries, which is the same artefact removed from
+    the BERT side in round 1 -- a message containing one exact dictionary
+    word scored 1.0 regardless of the rest of the message. Against the
+    centroid no single exact match can produce 1.0.
     """
     dictionary = DICTIONARY if dictionary is None else dictionary
     vectorizer = TfidfVectorizer()
     dict_vecs = vectorizer.fit_transform(list(dictionary))
+    prototype = np.asarray(dict_vecs.mean(axis=0)).ravel()
+    norm = np.linalg.norm(prototype)
+    if norm:
+        prototype = prototype / norm
     msg_vecs = vectorizer.transform(list(messages))
-    return cosine_similarity(msg_vecs, dict_vecs).max(axis=1)
+    return cosine_similarity(msg_vecs, prototype.reshape(1, -1)).ravel()
 
 
 def averaged_word_vector_scores(
@@ -230,7 +260,9 @@ def averaged_word_vector_scores(
     Each message's preprocessed words are embedded in ONE batched call,
     averaged, and compared with the same dictionary prototype. Unlike the
     main score this discards word order and context -- that contrast is the
-    point of the baseline.
+    point of the baseline. (This baseline already used the prototype, so
+    it never had the max-cosine / exact-match-1.0 artefact that the TF-IDF
+    baseline had before its round-2 fix.)
     """
     token_lists = [preprocess(m) for m in messages]
     flat = [tok for toks in token_lists for tok in toks]
